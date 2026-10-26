@@ -1,0 +1,32 @@
+{
+    "name": "idsecours-backend",
+    "version": "1.0.0",
+    "private": true,
+    "description": "API ID SECOURS - Node.js / Express / MySQL",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js",
+        "dev": "nodemon --watch src --watch .env server.js",
+        "db:init": "node scripts/db-init.js",
+        "db:reset": "node scripts/db-init.js --reset"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "dependencies": {
+        "bcryptjs": "^2.4.3",
+        "cors": "^2.8.5",
+        "dotenv": "^16.4.5",
+        "express": "^4.21.2",
+        "express-rate-limit": "^7.5.0",
+        "helmet": "^8.0.0",
+        "jsonwebtoken": "^9.0.2",
+        "morgan": "^1.10.0",
+        "multer": "^1.4.5-lts.1",
+        "mysql2": "^3.12.0",
+        "qrcode": "^1.5.4"
+    },
+    "devDependencies": {
+        "nodemon": "^3.1.14"
+    }
+}

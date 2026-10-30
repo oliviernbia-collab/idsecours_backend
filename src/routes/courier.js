@@ -28,10 +28,10 @@ router.use(h(async (req, res, next) => {
 
 const view = f => ({
   ref: f.ref, mission: f.mission_ref, cat: f.cat, step: f.step, slot: f.slot, repere: f.repere, commune: f.commune,
-  lat: +f.lat, lng: +f.lng, tel: f.tel ? U.fmtTel(f.tel) : null, handT: f.handed_at, depositT: f.deposit_at
+  lat: +f.lat, lng: +f.lng, tel: f.tel ? U.fmtTel(f.tel) : null, handT: f.handed_at, depositT: f.deposit_at, onsiteT: f.onsite_at, transitT: f.transit_at
 });
 const SQL = `SELECT f.*, c.label cat, COALESCE(u.tel, f.reporter_tel) tel FROM found_reports f JOIN doc_categories c ON c.code = f.category_code
-             LEFT JOIN users u ON u.id = f.reporter_user_id WHERE f.partner_id = ?`;
+             LEFT JOIN users u ON u.id = f.reporter_user_id WHERE f.partner_id = ? AND f.cancelled_at IS NULL`;
 
 router.get("/me", h(async (req, res) => res.json({ partner: { nom: req.partner.nom, collecteur: req.partner.collecteur, code: req.partner.collecteur_code, vehicule: req.partner.vehicule } })));
 router.get("/missions", h(async (req, res) => {
@@ -52,12 +52,30 @@ router.post("/missions/:ref/enroute", h(async (req, res) => {
   U.audit(null, "COURIER_ENROUTE", "found", f.ref, req.partner.collecteur_code);
   res.json({ ok: true });
 }));
+/* arrivée au point de collecte (Collecte §23 : SUR PLACE — arrivée confirmée) */
+router.post("/missions/:ref/onsite", h(async (req, res) => {
+  const f = await mission(req, [4]);
+  if (f.onsite_at) fail(409, "Arrivée déjà confirmée.");
+  await q("UPDATE found_reports SET onsite_at = NOW(), step_at = NOW() WHERE id = ?", [f.id]);
+  await U.notify(f.reporter_user_id, "Livreur sur place", `${req.partner.collecteur} est arrivé au point de collecte (mission ${f.mission_ref}). Présentez votre code de remise.`, "collecte|" + f.ref);
+  if (!f.reporter_user_id && f.reporter_tel) await U.sms(f.reporter_tel, `ID SECOURS : le livreur ${req.partner.collecteur} est sur place (mission ${f.mission_ref}). Ne remettez le document qu’après validation de votre code.`);
+  U.audit(null, "COURIER_ONSITE", "found", f.ref, req.partner.collecteur_code);
+  res.json({ ok: true });
+}));
+/* départ vers l'agence avec le document (Collecte §23 : EN TRANSIT — acheminement vers l'agence) */
+router.post("/missions/:ref/transit", h(async (req, res) => {
+  const f = await mission(req, [5]);
+  if (f.transit_at) fail(409, "Départ déjà signalé.");
+  await q("UPDATE found_reports SET transit_at = NOW() WHERE id = ?", [f.id]);
+  U.audit(null, "COURIER_TRANSIT", "found", f.ref, req.partner.collecteur_code);
+  res.json({ ok: true });
+}));
 /* validation du code / QR présenté par la personne qui a trouvé le document (R50) */
 router.post("/missions/:ref/handover", h(async (req, res) => {
   const f = await mission(req, [3, 4]);
   const code = String(req.body.code || "").trim().replace(/^IDSECOURS:COL:[^:]+:/, "");
   if (code !== f.collect_code) { U.audit(null, "COLLECT_CODE_KO", "found", f.ref, req.partner.collecteur_code); fail(400, "Code de collecte invalide."); }
-  await q("UPDATE found_reports SET step = 5, step_at = NOW(), handed_at = NOW() WHERE id = ?", [f.id]);
+  await q("UPDATE found_reports SET step = 5, step_at = NOW(), handed_at = NOW(), onsite_at = COALESCE(onsite_at, NOW()) WHERE id = ?", [f.id]);
   await U.notify(f.reporter_user_id, "Document collecté", `Mission ${f.mission_ref} · code invalidé. Merci pour votre geste !`, "collecte|" + f.ref);
   U.audit(null, "COLLECT_HANDOVER", "found", f.ref, req.partner.collecteur_code);
   res.json({ ok: true });

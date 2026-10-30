@@ -70,7 +70,7 @@ async function sosTick() {
 
 /* transmission de la mission au portail du livreur (② déploiement d'un livreur) ; la suite est faite par le livreur */
 async function collectTick() {
-  const rows = await q("SELECT f.id, f.reporter_user_id, f.ref, f.mission_ref, p.nom pnom FROM found_reports f JOIN partners p ON p.id = f.partner_id WHERE f.step = 2 AND TIMESTAMPDIFF(SECOND, f.step_at, NOW()) >= 3");
+  const rows = await q("SELECT f.id, f.reporter_user_id, f.ref, f.mission_ref, p.nom pnom FROM found_reports f JOIN partners p ON p.id = f.partner_id WHERE f.step = 2 AND f.cancelled_at IS NULL AND TIMESTAMPDIFF(SECOND, f.step_at, NOW()) >= 3");
   for (const f of rows) {
     await q("UPDATE found_reports SET step = 3, step_at = NOW() WHERE id = ? AND step = 2", [f.id]);
     await U.notify(f.reporter_user_id, "Mission transmise au livreur", `${f.pnom} a reçu la mission ${f.mission_ref}.`, "collecte|" + f.ref);
@@ -105,6 +105,9 @@ function start() {
   /* sauvegarde automatique (périodicité : paramètre backup_auto_h) */
   const runBackup = () => require("./backup").autoTick().catch(e => console.error("[sauvegarde]", e.message));
   setTimeout(runBackup, 30000); setInterval(runBackup, 600000);
+  /* relances de renouvellement automatiques (Commercial §25–§27) */
+  const runRenew = () => require("./renewals").autoTick().catch(e => console.error("[relances]", e.message));
+  setTimeout(runRenew, 20000); setInterval(runRenew, 600000);
   setInterval(async () => {
     if (busy) return; busy = true;
     try { await sosTick(); await collectTick(); if (Date.now() - protAt > 10000) { protAt = Date.now(); await protectionTick(); } } catch (e) { console.error("[engine]", e.message); } finally { busy = false; }

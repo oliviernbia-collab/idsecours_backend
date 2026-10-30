@@ -152,6 +152,7 @@ async function migrate() {
       ('Orange Côte d’Ivoire — boutiques', 'Distributeur', 'Direction partenariats', '27 20 00 10 10', 5, 'PROSPECT', 'Vente des packs en boutique'),
       ('Université Félix Houphouët-Boigny', 'Établissement', 'Service de la vie étudiante', '27 22 44 00 00', 0, 'ACTIF', 'Pack Étudiant pour les nouveaux inscrits')`);
   await migrateCdc();
+  await migrateCdc2();
 }
 
 /* compléments du cahier des charges (audit de conformité) */
@@ -250,6 +251,57 @@ async function migrateCdc() {
   await addCol("pay_methods", "fee_pct", "DECIMAL(5,2) NOT NULL DEFAULT 0");
   await addCol("pay_methods", "fee_fixed", "INT NOT NULL DEFAULT 0");
   await addCol("pay_methods", "env", "VARCHAR(12) NOT NULL DEFAULT 'SIMULATION'");
+}
+
+/* compléments du cahier (2e passe) : statuts de collecte, emplacements de stockage, renouvellements */
+async function migrateCdc2() {
+  /* Collecte §23 : SUR PLACE, EN TRANSIT, ANNULÉE (avec motif) */
+  await addCol("found_reports", "onsite_at", "DATETIME NULL");
+  await addCol("found_reports", "transit_at", "DATETIME NULL");
+  await addCol("found_reports", "cancelled_at", "DATETIME NULL");
+  await addCol("found_reports", "cancel_motif", "VARCHAR(200) NULL");
+
+  /* Réception §29–§33 : Agence → Salle → Armoire/Coffre → Compartiment, capacité, statut, QR d'emplacement */
+  await q(`CREATE TABLE IF NOT EXISTS storage_locations (id INT AUTO_INCREMENT PRIMARY KEY, agency_id INT NOT NULL, salle VARCHAR(10) NOT NULL, armoire VARCHAR(10) NOT NULL,
+    compartiment VARCHAR(10) NOT NULL, code VARCHAR(40) NOT NULL, kind ENUM('ARMOIRE','COFFRE') NOT NULL DEFAULT 'ARMOIRE', capacite INT NOT NULL DEFAULT 5,
+    status ENUM('ACTIF','RESERVE','BLOQUE','MAINTENANCE') NOT NULL DEFAULT 'ACTIF', status_motif VARCHAR(200), created_by INT, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_loc (agency_id, code)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await addCol("held_documents", "location_id", "INT NULL");
+  await addCol("held_documents", "stored_at", "DATETIME NULL");
+  await addCol("held_documents", "stored_by", "INT NULL");
+  if (!(await one("SELECT COUNT(*) n FROM storage_locations")).n) {
+    const ags = await q("SELECT id FROM agencies");
+    for (const a of ags) for (const s of ["A", "B"]) for (const ar of ["01", "02", "03"]) for (const c of ["01", "02", "03", "04"])
+      await q("INSERT IGNORE INTO storage_locations (agency_id, salle, armoire, compartiment, code, kind, capacite) VALUES (?,?,?,?,?,?,5)", [a.id, s, ar, c, `${s}-${ar}-${c}`, s === "B" && ar === "03" ? "COFFRE" : "ARMOIRE"]);
+    /* emplacements déjà saisis en texte libre (format A-01-03) : rattachés à la hiérarchie */
+    for (const h of await q("SELECT id, agency_id, emplacement FROM held_documents WHERE emplacement IS NOT NULL AND status NOT IN ('RESTITUE','TRANSFERE','EN_TRANSIT')")) {
+      const m = /^([A-Z0-9]+)-([A-Z0-9]+)-([A-Z0-9]+)$/i.exec(h.emplacement.trim()); if (!m) continue;
+      const code = m.slice(1).join("-").toUpperCase();
+      await q("INSERT IGNORE INTO storage_locations (agency_id, salle, armoire, compartiment, code) VALUES (?,?,?,?,?)", [h.agency_id, m[1].toUpperCase(), m[2].toUpperCase(), m[3].toUpperCase(), code]);
+      const l = await one("SELECT id FROM storage_locations WHERE agency_id = ? AND code = ?", [h.agency_id, code]);
+      await q("UPDATE held_documents SET location_id = ?, emplacement = ?, stored_at = COALESCE(stored_at, received_at) WHERE id = ?", [l.id, code, h.id]);
+    }
+  }
+
+  /* Commercial §25–§28 : échéances de renouvellement, message paramétrable, relances automatiques et historique */
+  await q("INSERT IGNORE INTO settings (k, v) VALUES ('renew_message', ?)", ["Bonjour {prenom}, votre abonnement ID SECOURS ({formule}) arrive à expiration le {date}. Renouvelez votre abonnement afin de maintenir actifs les services associés à votre dossier."]);
+  await q("INSERT IGNORE INTO settings (k, v) VALUES ('renew_auto', '1')");
+  await q("INSERT IGNORE INTO settings (k, v) VALUES ('renew_echeances', '30,15,7,3,0')");
+  await q(`CREATE TABLE IF NOT EXISTS renewal_reminders (id INT AUTO_INCREMENT PRIMARY KEY, protection_id INT, user_id INT NOT NULL, echeance INT NULL,
+    channel VARCHAR(40) NOT NULL, campaign_ref VARCHAR(30) NULL, message VARCHAR(600) NOT NULL, result VARCHAR(80) NOT NULL, staff_id INT NULL, auto_key VARCHAR(40) NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uq_auto (auto_key), KEY k_user (user_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  /* Support aux agences (organigramme) : demandes d'assistance des agents, traitées par le Support technique */
+  await addCol("ops_incidents", "kind", "VARCHAR(20) NOT NULL DEFAULT 'INCIDENT'");
+  await addCol("ops_incidents", "categorie", "VARCHAR(40) NULL");
+  await addCol("ops_incidents", "reponse", "VARCHAR(600) NULL");
+  await addCol("ops_incidents", "repondu_at", "DATETIME NULL");
+  await addCol("ops_incidents", "repondu_by", "INT NULL");
+  /* avis de satisfaction après une étape terminée (un par dossier) */
+  await q(`CREATE TABLE IF NOT EXISTS feedbacks (id INT AUTO_INCREMENT PRIMARY KEY, context VARCHAR(20) NOT NULL, ref VARCHAR(40) NOT NULL, user_id INT NULL, staff_id INT NULL,
+    agency_id INT NULL, partner_id INT NULL, note TINYINT NOT NULL, commentaire VARCHAR(500) NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_fb (context, ref), KEY k_ctx (context, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  await grant("support.request", "Support", "Demander l’assistance du Support technique (support aux agences)", ["DIRECTION", "FINANCE", "OPERATIONS", "COMMERCIAL", "COLLECTE", "VERIFICATION", "RECEPTION"]);
 }
 
 module.exports = { migrate };

@@ -80,4 +80,50 @@ router.get("/backups/:id/download", can("staff.manage"), h(async (req, res) => {
   res.download(path.join(B.DIR, b.file), b.file);
 }));
 
+/* ---------- support aux agences : demandes d'assistance des agents (organigramme) ---------- */
+const ASSIST_CAT = ["Matériel (scanner, imprimante, poste)", "Accès / compte / mot de passe", "Application ou back-office", "Paiement / caisse", "Réseau / connexion", "Procédure à clarifier", "Autre"];
+router.get("/assistance", can("support.request"), h(async (req, res) => {
+  const items = await q(`SELECT o.ref, o.titre, o.description, o.categorie, o.priorite, o.statut, o.dossier_ref, o.reponse, o.repondu_at, o.created_at, CONCAT(s.prenom, ' ', s.nom) repondant,
+      (SELECT f.note FROM feedbacks f WHERE f.context = 'ASSISTANCE' AND f.ref = o.ref) avis
+    FROM ops_incidents o LEFT JOIN staff s ON s.id = o.repondu_by WHERE o.kind = 'ASSISTANCE' AND o.created_by = ? ORDER BY o.id DESC LIMIT 100`, [req.staff.id]);
+  res.json({ items, categories: ASSIST_CAT });
+}));
+router.post("/assistance", can("support.request"), h(async (req, res) => {
+  const b = req.body, titre = str(b.titre, 160);
+  if (!titre || !str(b.description)) fail(400, "Objet et description obligatoires.");
+  const cat = ASSIST_CAT.includes(b.categorie) ? b.categorie : "Autre", prio = ["BASSE", "NORMALE", "HAUTE", "CRITIQUE"].includes(b.priorite) ? b.priorite : "NORMALE";
+  const ref = "INC-" + (await U.nextRef("inc", "X")).split("-").pop().replace(/^0+/, "");
+  await q("INSERT INTO ops_incidents (ref, kind, categorie, titre, description, priorite, dossier_ref, created_by, agency_id) VALUES (?, 'ASSISTANCE', ?,?,?,?,?,?,?)",
+    [ref, cat, titre, str(b.description, 1000), prio, str(b.dossier, 30), req.staff.id, req.staff.agency_id || null]);
+  const ag = req.staff.agency_id ? (await one("SELECT nom FROM agencies WHERE id = ?", [req.staff.agency_id])).nom : "Siège";
+  await require("../lib/alerts").push("assist:" + ref, ["incidents.manage"], "Demande d’assistance · " + ag, `${ref} · ${cat} · ${titre}`, "incidents", prio === "CRITIQUE" ? "CRITIQUE" : prio === "HAUTE" ? "HAUTE" : "NORMALE");
+  U.audit(req, "ASSISTANCE_REQUESTED", "incident", ref, cat);
+  res.status(201).json({ ref });
+}));
+
+router.post("/assistance/:ref/feedback", can("support.request"), h(async (req, res) => {
+  const o = await one("SELECT * FROM ops_incidents WHERE ref = ? AND kind = 'ASSISTANCE' AND created_by = ?", [req.params.ref, req.staff.id]); if (!o) fail(404, "Demande introuvable.");
+  if (!["RÉSOLU", "CLÔTURÉ"].includes(o.statut)) fail(409, "Vous pourrez évaluer l’assistance une fois la demande résolue.");
+  await require("./feedback").save({ context: "ASSISTANCE", ref: o.ref, agency_id: o.agency_id }, { ...req.body, staffId: req.staff.id });
+  U.audit(req, "FEEDBACK", "feedback", o.ref, `ASSISTANCE · ${req.body.note}/5`); res.status(201).json({ ok: true });
+}));
+
+/* ---------- satisfaction : notes moyennes par étape, agence et partenaire, derniers commentaires ---------- */
+router.get("/feedback", can("performance.view", "incidents.manage", "staff.manage"), h(async (req, res) => {
+  const days = Math.min(365, parseInt(req.query.days, 10) || 90), ctx = Object.keys(require("./feedback").CONTEXT).includes(req.query.context) ? req.query.context : null;
+  const where = "f.created_at > DATE_SUB(NOW(), INTERVAL ? DAY)" + (ctx ? " AND f.context = ?" : ""), args = ctx ? [days, ctx] : [days];
+  const [tot, byCtx, byAgency, byPartner, dist, items] = await Promise.all([
+    one(`SELECT COUNT(*) n, ROUND(AVG(note), 2) avg, SUM(note >= 4) satisfaits, SUM(note <= 2) mecontents FROM feedbacks f WHERE ${where}`, args),
+    q(`SELECT context, COUNT(*) n, ROUND(AVG(note), 2) avg FROM feedbacks f WHERE ${where} GROUP BY context`, args),
+    q(`SELECT a.nom l, COUNT(*) n, ROUND(AVG(f.note), 2) avg FROM feedbacks f JOIN agencies a ON a.id = f.agency_id WHERE ${where} GROUP BY a.id ORDER BY avg`, args),
+    q(`SELECT p.nom l, COUNT(*) n, ROUND(AVG(f.note), 2) avg FROM feedbacks f JOIN partners p ON p.id = f.partner_id WHERE ${where} GROUP BY p.id ORDER BY avg`, args),
+    q(`SELECT note, COUNT(*) n FROM feedbacks f WHERE ${where} GROUP BY note`, args),
+    q(`SELECT f.id, f.context, f.ref, f.note, f.commentaire, f.created_at, a.nom agence, p.nom partner, u.prenom, LEFT(u.nom, 1) ini, CONCAT(s.prenom, ' ', s.nom) agent
+      FROM feedbacks f LEFT JOIN agencies a ON a.id = f.agency_id LEFT JOIN partners p ON p.id = f.partner_id LEFT JOIN users u ON u.id = f.user_id LEFT JOIN staff s ON s.id = f.staff_id
+      WHERE ${where} ORDER BY f.id DESC LIMIT 200`, args)
+  ]);
+  res.json({ days, total: { n: tot.n, avg: tot.avg, satisfaction: tot.n ? Math.round(tot.satisfaits * 100 / tot.n) : null, mecontents: +tot.mecontents || 0 },
+    byContext: byCtx, byAgency, byPartner, dist, items, contexts: require("./feedback").CONTEXT });
+}));
+
 module.exports = router;

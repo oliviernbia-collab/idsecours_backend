@@ -77,6 +77,9 @@ router.post("/campaigns/:ref/launch", can("prospects.manage"), h(async (req, res
     if (notif) await U.notify(u.id, c.nom, c.message, "protChoice");
     if (sms && u.tel) await U.sms(u.tel, `ID SECOURS : ${c.message}`);
     await q("INSERT INTO campaign_targets (campaign_id, user_id, canal) VALUES (?,?,?)", [c.id, u.id, c.canal]); n++;
+    /* campagne de renouvellement : inscrite dans l'historique des relances (§28) */
+    if (["EXPIRANT", "ANCIENS"].includes(c.segment)) await q("INSERT INTO renewal_reminders (user_id, channel, campaign_ref, message, result, staff_id) VALUES (?,?,?,?,?,?)",
+      [u.id, c.canal, c.ref, String(c.message).slice(0, 600), "Envoyé", req.staff.id]);
   }
   await q("UPDATE campaigns SET statut = 'EN_COURS', launched_at = NOW() WHERE id = ?", [c.id]);
   U.audit(req, "CAMPAIGN_LAUNCHED", "campaign", c.ref, `${n} envoi(s)`); res.json({ ok: true, sent: n });

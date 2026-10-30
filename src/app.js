@@ -30,6 +30,7 @@ app.use("/api/payments", require("./routes/payments"));
 app.use("/api/recoveries", require("./routes/recoveries"));
 app.use("/api/messages", require("./routes/messages"));
 app.use("/api/sos", require("./routes/sos"));
+app.use("/api/feedback", require("./routes/feedback"));
 app.use("/api/alert", require("./routes/sos").publicAlert);
 app.use("/api/admin", require("./routes/admin"));
 app.use("/api/admin", require("./routes/stock"));

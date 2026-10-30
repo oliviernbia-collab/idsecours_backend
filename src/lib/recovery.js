@@ -31,7 +31,7 @@ async function complete(r, { staffId = null, label, mode = null, signature = nul
   const proof = await U.nextRef("res", "RES");
   await tx(async c => {
     await c.query("UPDATE recoveries SET done_at = NOW(), done_by = ?, status = 'RÉCUPÉRÉ', proof_ref = ?, proof_mode = ?, signature = ? WHERE id = ?", [staffId, proof, mode, signature, r.id]);
-    await c.query("UPDATE held_documents SET status = 'RESTITUE', emplacement = NULL WHERE id = ?", [r.held_id]);
+    await c.query("UPDATE held_documents SET status = 'RESTITUE', emplacement = NULL, location_id = NULL, stored_at = NULL WHERE id = ?", [r.held_id]);
     await c.query("INSERT INTO stock_movements (held_id, label, staff_id) VALUES (?, ?, ?)", [r.held_id, label, staffId]);
     if (r.document_id) {
       await c.query("UPDATE documents SET status = 'RECUPERE' WHERE id = ?", [r.document_id]);
@@ -43,7 +43,7 @@ async function complete(r, { staffId = null, label, mode = null, signature = nul
       }
     }
   });
-  await U.notify(r.user_id, "Document récupéré", `Dossier ${r.ref} clôturé · preuve de restitution ${proof}.`, "recDone|" + r.ref);
+  await U.notify(r.user_id, "Document récupéré", `Dossier ${r.ref} clôturé · preuve de restitution ${proof}. Donnez votre avis sur le service (1 minute).`, "recDone|" + r.ref);
   return proof;
 }
 

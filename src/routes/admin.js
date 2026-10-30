@@ -4,6 +4,8 @@ const router = require("express").Router();
 const bcrypt = require("bcryptjs");
 const rateLimit = require("express-rate-limit");
 const QRCode = require("qrcode");
+const LOC = require("../lib/locations");
+const RNW = require("../lib/renewals");
 const { q, one, tx } = require("../config/db");
 const U = require("../lib/util");
 const D = require("../lib/domain");
@@ -127,7 +129,7 @@ router.get("/dashboard/service", can("dashboard.view"), h(async (req, res) => {
     const k = await one(`SELECT COALESCE(SUM(CASE WHEN status = 'RÉUSSI' THEN amount END),0) total, COALESCE(SUM(CASE WHEN status = 'RÉUSSI' AND kind IN ('indiv','pack','formule','renew') THEN amount END),0) abos,
       COALESCE(SUM(CASE WHEN status = 'RÉUSSI' AND kind IN ('frais','livraison') THEN amount END),0) frais, SUM(status = 'RÉUSSI') recus, COALESCE(SUM(refunded_amount),0) rembourse,
       SUM(status = 'RÉUSSI' AND (reconciled IS NULL OR reconciled = 'À RAPPROCHER')) a_rapprocher FROM payments`);
-    return res.json({ title: "Direction financière & comptabilité", kpis: [K("money", "Revenus totaux", fcfa(+k.total), "green"), K("crown", "Revenus des abonnements", fcfa(+k.abos), "green"), K("receipt", "Frais de récupération & livraison", fcfa(+k.frais)), K("check", "Paiements reçus", +k.recus || 0), K("refresh", "Remboursements", fcfa(+k.rembourse), "red"), K("list", "Transactions à rapprocher", +k.a_rapprocher || 0, "orange")],
+    return res.json({ title: "Direction financière & comptabilité", kpis: [K("money", "Revenus totaux", fcfa(+k.total), "green"), K("crown", "Revenus des abonnements", fcfa(+k.abos), "blue"), K("receipt", "Frais de récupération & livraison", fcfa(+k.frais), "orange"), K("check", "Paiements reçus", +k.recus || 0, "violet"), K("refresh", "Remboursements", fcfa(+k.rembourse), "red"), K("list", "Transactions à rapprocher", +k.a_rapprocher || 0, "teal")],
       series: { title: "Transactions encaissées (7 jours)", data: await last7("SELECT DATE(created_at) d, COUNT(*) n FROM payments WHERE status = 'RÉUSSI' AND created_at > DATE_SUB(NOW(), INTERVAL 7 DAY) GROUP BY d") },
       bars: { title: "Revenus par moyen de paiement (FCFA)", data: (await q("SELECT m.label l, COALESCE(SUM(p.amount),0) v FROM pay_methods m LEFT JOIN payments p ON p.method = m.code AND p.status = 'RÉUSSI' GROUP BY m.code ORDER BY m.position")).map(x => ({ l: x.l, v: +x.v })) },
       links: [["finance", "Paiements, factures & rapports"]] });
@@ -173,7 +175,7 @@ router.get("/users", can("users.view"), h(async (req, res) => {
   const { limit, offset } = paging(req), s = req.query.q;
   const rows = await q(`SELECT u.id, u.prenom, u.nom, u.tel, u.email, u.commune, u.status, u.created_at,
       (SELECT COUNT(*) FROM documents d WHERE d.user_id = u.id) docs,
-      (SELECT COUNT(*) FROM protections p WHERE p.user_id = u.id AND p.exp_at > NOW() AND p.suspended = 0) prots
+      (SELECT COUNT(*) FROM protections p WHERE p.user_id = u.id AND p.exp_at > NOW() AND p.suspended = 0) prots, ${RNW.PORTFOLIO_SQL} portefeuille
     FROM users u ${s ? "WHERE u.nom LIKE ? OR u.prenom LIKE ? OR u.tel LIKE ?" : ""} ORDER BY u.id DESC LIMIT ? OFFSET ?`, s ? [like(s), like(s), like(U.normTel(s) || s), limit, offset] : [limit, offset]);
   res.json({ items: rows });
 }));
@@ -208,22 +210,36 @@ router.post("/declarations/:ref/status", can("declarations.manage"), h(async (re
 /* ---------- collecte & livraison ---------- */
 router.get("/founds", can("founds.view", "collectes.manage"), h(async (req, res) => {
   const rows = await q(`SELECT f.ref, f.created_at, f.category_code, c.short cat, f.numero, f.nom_visible, f.registered, f.commune, f.repere, f.slot, f.step, f.mission_ref, f.handed_at, f.received_at,
-      p.nom partner, p.collecteur FROM found_reports f JOIN doc_categories c ON c.code = f.category_code LEFT JOIN partners p ON p.id = f.partner_id ORDER BY f.id DESC LIMIT 200`);
+      f.assigned_at, f.courier_enroute_at, f.onsite_at, f.transit_at, f.cancelled_at, f.cancel_motif, a.nom agence,
+      (SELECT COUNT(*) FROM ops_incidents i WHERE i.dossier_ref = f.ref AND i.statut IN ('OUVERT','EN COURS')) incident,
+      p.nom partner, p.collecteur FROM found_reports f LEFT JOIN agencies a ON a.id = f.agency_id JOIN doc_categories c ON c.code = f.category_code LEFT JOIN partners p ON p.id = f.partner_id ORDER BY f.id DESC LIMIT 200`);
   res.json({ items: rows.map(r => ({ ...r, numero: r.numero ? U.maskNum(r.numero) : null, registered: !!r.registered })) });
 }));
 router.post("/founds/:ref/assign", can("collectes.manage"), h(async (req, res) => {
   const f = await one("SELECT * FROM found_reports WHERE ref = ?", [req.params.ref]); if (!f) fail(404, "Signalement introuvable.");
   const p = await one("SELECT * FROM partners WHERE id = ? AND status = 'ACTIF'", [req.body.partner]); if (!p) fail(400, "Partenaire indisponible.");
   if (f.step >= 5) fail(409, "Document déjà remis.");
+  if (f.cancelled_at) fail(409, "Collecte annulée.");
   const mission = f.mission_ref || "MIS-" + (await U.nextRef("mis", "X")).split("-").pop().slice(-5);
   await q("UPDATE found_reports SET partner_id = ?, mission_ref = ?, step = GREATEST(step, 2), step_at = NOW(), assigned_at = NOW() WHERE id = ?", [p.id, mission, f.id]);
   U.audit(req, "COLLECT_ASSIGNED", "found", f.ref, `${p.nom} · ${mission}`);
   res.json({ ok: true });
 }));
 /* validation du code de remise par le collecteur (QR / code alternatif) — R50 */
+/* annulation d'une collecte (Collecte §23 : ANNULÉE — mission annulée avec motif), avant la remise au livreur */
+router.post("/founds/:ref/cancel", can("collectes.manage"), h(async (req, res) => {
+  const f = await one("SELECT * FROM found_reports WHERE ref = ?", [req.params.ref]); if (!f) fail(404, "Signalement introuvable.");
+  if (f.cancelled_at) fail(409, "Collecte déjà annulée.");
+  if (f.step >= 5) fail(409, "Le document a déjà été remis au livreur : la collecte ne peut plus être annulée (suivre la réception en agence).");
+  const motif = str(req.body.motif, 200); if (!motif) fail(400, "Motif d’annulation obligatoire.");
+  await q("UPDATE found_reports SET cancelled_at = NOW(), cancel_motif = ? WHERE id = ?", [motif, f.id]);
+  await U.notify(f.reporter_user_id, "Collecte annulée", `Signalement ${f.ref} : la collecte a été annulée (${motif}). ID SECOURS vous recontactera si nécessaire.`, "collecte|" + f.ref);
+  U.audit(req, "COLLECT_CANCELLED", "found", f.ref, motif);
+  res.json({ ok: true });
+}));
 router.post("/founds/:ref/handover", can("collectes.manage"), h(async (req, res) => {
   const f = await one("SELECT * FROM found_reports WHERE ref = ?", [req.params.ref]); if (!f) fail(404, "Signalement introuvable.");
-  if (f.step < 3 || f.step >= 5) fail(409, "La mission n’est pas en attente de remise.");
+  if (f.step < 3 || f.step >= 5 || f.cancelled_at) fail(409, "La mission n’est pas en attente de remise.");
   if (String(req.body.code || "").trim() !== f.collect_code) { U.audit(req, "COLLECT_CODE_KO", "found", f.ref); fail(400, "Code de collecte invalide."); }
   await q("UPDATE found_reports SET step = 5, step_at = NOW(), handed_at = NOW() WHERE id = ?", [f.id]);
   await U.notify(f.reporter_user_id, "Document collecté", `Mission ${f.mission_ref} · code invalidé.`, "collecte|" + f.ref);
@@ -306,9 +322,16 @@ router.get("/partners", can("founds.view", "collectes.manage", "partners.manage"
     (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id) livraisons,
     (SELECT ROUND(AVG(TIMESTAMPDIFF(MINUTE, d.out_at, d.delivered_at)) / 60, 1) FROM deliveries d WHERE d.partner_id = p.id AND d.delivered_at IS NOT NULL) livraison_h,
     (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id AND d.status IN ('ECHEC','REMISE_BLOQUEE','RETOURNEE')) echecs,
-    (SELECT COUNT(*) FROM ops_incidents i JOIN found_reports f ON f.ref = i.dossier_ref WHERE f.partner_id = p.id) incidents
+    (SELECT COUNT(*) FROM ops_incidents i JOIN found_reports f ON f.ref = i.dossier_ref WHERE f.partner_id = p.id) incidents,
+    /* suivi des livreurs (Collecte §27) : état terrain de la mission en cours la plus avancée */
+    (SELECT CASE WHEN SUM(f.step = 5 AND f.transit_at IS NOT NULL) > 0 THEN 'EN_TRANSIT' WHEN SUM(f.step = 4 AND f.onsite_at IS NOT NULL) > 0 THEN 'SUR_PLACE'
+      WHEN SUM(f.step = 4) > 0 THEN 'EN_ROUTE' WHEN COUNT(*) > 0 THEN 'EN_MISSION' END FROM found_reports f WHERE f.partner_id = p.id AND f.step BETWEEN 2 AND 5 AND f.cancelled_at IS NULL) terrain,
+    (SELECT f.mission_ref FROM found_reports f WHERE f.partner_id = p.id AND f.step BETWEEN 2 AND 5 AND f.cancelled_at IS NULL ORDER BY f.step DESC LIMIT 1) mission_actuelle,
+    (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id AND d.status = 'EN_LIVRAISON') livr_en_cours,
+    (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id AND DATE(f.assigned_at) = CURDATE()) + (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id AND DATE(d.created_at) = CURDATE()) missions_jour
     FROM partners p ORDER BY p.id`);
-  res.json({ items: rows.map(({ pin_hash, ...p }) => ({ ...p, contrat_expire: !!p.contrat_fin && new Date(p.contrat_fin) < new Date() })) });
+  res.json({ items: rows.map(({ pin_hash, ...p }) => ({ ...p, contrat_expire: !!p.contrat_fin && new Date(p.contrat_fin) < new Date(),
+    terrain: p.status !== "ACTIF" ? "INDISPONIBLE" : p.terrain || (p.livr_en_cours ? "EN_MISSION" : "DISPONIBLE") })) });
 }));
 router.post("/partners", can("partners.manage"), h(async (req, res) => {
   const b = req.body; if (!str(b.nom) || !str(b.collecteur)) fail(400, "Nom et collecteur obligatoires.");
@@ -348,7 +371,7 @@ router.patch("/partners/:id", can("partners.manage"), h(async (req, res) => {
 router.get("/reception/pending", can("reception.manage"), h(async (req, res) => {
   res.json({ items: await q(`SELECT f.ref, f.category_code, c.short cat, f.numero, f.nom_visible, f.mission_ref, f.handed_at, p.nom partner, p.collecteur
     FROM found_reports f JOIN doc_categories c ON c.code = f.category_code LEFT JOIN partners p ON p.id = f.partner_id
-    WHERE f.step = 5 ORDER BY f.handed_at`) });
+    WHERE f.step = 5 AND f.cancelled_at IS NULL ORDER BY f.handed_at`) });
 }));
 const ANOMALIES = ["Document conforme", "Document endommagé", "Document différent", "Document absent", "Enveloppe/conditionnement endommagé", "Référence incorrecte", "Autre anomalie"];
 const ETATS = ["Bon état", "État moyen", "Endommagé", "Très endommagé", "Illisible / à contrôler"];
@@ -370,33 +393,38 @@ router.post("/reception", can("reception.manage"), upload.fields([{ name: "recto
   let incident = null;
   if (anomalie !== "Document conforme") incident = await createIncident(req, `Incident partenaire : ${anomalie.toLowerCase()}`, `${f ? `Mission ${f.mission_ref} · ` : ""}${str(b.motif, 500) || ""}`, "HAUTE", f ? f.ref : null);
   if (anomalie === "Document absent") { U.audit(req, "RECEPTION_ABSENT", "found", f && f.ref, incident); return res.status(201).json({ ref: null, incident }); }
+  /* seuls les emplacements actifs, disponibles et compatibles sont acceptés (§29) */
+  const loc = await LOC.pick(agency, b);
   const ref = await U.nextRef("rcp", "IDS-RCP");
-  const r = await q(`INSERT INTO held_documents (reception_ref, found_id, category_code, numero, nom, etat_physique, etat_observation, etat, agency_id, emplacement, internal_qr, status, received_by, anomalie, photo_recto, photo_verso, photo_anomalie)
-                     VALUES (?,?,?,?,?,?,?, 'Reçu par ID SECOURS', ?,?,?, 'A_CONTROLER', ?, ?, ?, ?, ?)`,
-    [ref, f ? f.id : null, cat, numero, nom ? nom.toUpperCase() : null, b.etatPhysique || "Bon état", str(b.observation, 255), agency, str(b.emplacement, 40), U.token(8), req.staff.id,
+  const r = await q(`INSERT INTO held_documents (reception_ref, found_id, category_code, numero, nom, etat_physique, etat_observation, etat, agency_id, emplacement, location_id, internal_qr, status, received_by, anomalie, photo_recto, photo_verso, photo_anomalie)
+                     VALUES (?,?,?,?,?,?,?, 'Reçu par ID SECOURS', ?,?,?,?, 'A_CONTROLER', ?, ?, ?, ?, ?)`,
+    [ref, f ? f.id : null, cat, numero, nom ? nom.toUpperCase() : null, b.etatPhysique || "Bon état", str(b.observation, 255), agency, loc ? loc.code : null, loc ? loc.id : null, U.token(8), req.staff.id,
      anomalie === "Document conforme" ? null : anomalie, photo("recto"), photo("verso"), photo("anomaliePhoto")]);
-  await q("INSERT INTO stock_movements (held_id, label, staff_id) VALUES (?,?,?)", [r.insertId, `Réception ${ref}${f ? " · mission " + f.mission_ref : " · dépôt direct"}${b.emplacement ? " · emplacement " + b.emplacement : ""} · en attente de contrôle`, req.staff.id]);
+  await q("INSERT INTO stock_movements (held_id, label, staff_id) VALUES (?,?,?)", [r.insertId, `Réception ${ref}${f ? " · mission " + f.mission_ref : " · dépôt direct"}${loc ? " · emplacement affecté " + loc.code : ""} · en attente de contrôle`, req.staff.id]);
   if (f) {
     await q("UPDATE found_reports SET step = 6, step_at = NOW(), received_at = NOW(), agency_id = ? WHERE id = ?", [agency, f.id]);
-    await U.notify(f.reporter_user_id, "Document reçu par ID SECOURS", `Signalement ${f.ref} : le document est arrivé en agence. Il est en cours de contrôle.`, "collecte|" + f.ref);
+    await U.notify(f.reporter_user_id, "Document reçu par ID SECOURS", `Signalement ${f.ref} : le document est arrivé en agence. Il est en cours de contrôle. Merci ! Donnez votre avis sur la collecte.`, "collecte|" + f.ref);
   }
   U.audit(req, "RECEPTION", "held", ref, f ? f.ref : "dépôt direct");
-  res.status(201).json({ ref, incident, qr: await QRCode.toDataURL(`IDSECOURS:INT:${ref}`, { margin: 1, width: 240 }) });
+  res.status(201).json({ ref, id: r.insertId, emplacement: loc ? loc.code : null, located: !!(loc && loc.id), incident, qr: await QRCode.toDataURL(`IDSECOURS:INT:${ref}`, { margin: 1, width: 240 }) });
 }));
 router.get("/stock", can("stock.view", "reception.manage"), h(async (req, res) => {
-  const rows = await q(`SELECT h.id, h.reception_ref, h.category_code, c.short cat, h.numero, h.nom, h.etat_physique, h.status, h.emplacement, h.received_at, a.nom agence
+  const rows = await q(`SELECT h.id, h.reception_ref, h.category_code, c.short cat, h.numero, h.nom, h.etat_physique, h.status, h.emplacement, h.location_id, h.stored_at, h.agency_id, h.received_at, a.nom agence
     FROM held_documents h JOIN doc_categories c ON c.code = h.category_code JOIN agencies a ON a.id = h.agency_id ORDER BY h.id DESC LIMIT 300`);
   res.json({ items: rows.map(r => ({ ...r, numero: r.numero ? U.maskNum(r.numero) : null })) });
 }));
 router.post("/stock/:id/move", can("reception.manage"), h(async (req, res) => {
   const hd = await one("SELECT * FROM held_documents WHERE id = ?", [req.params.id]); if (!hd) fail(404, "Document introuvable.");
-  const emp = str(req.body.emplacement, 40), st = req.body.status;
+  const st = req.body.status;
+  const loc = await LOC.pick(hd.agency_id, req.body, hd.id), emp = loc ? loc.code : null;
   if (!emp && !st) fail(400, "Indiquez un emplacement ou un statut.");
   if (st && !["CONSERVE", "QUARANTAINE"].includes(st)) fail(400, "Statut non autorisé ici.");
   /* la Réception ne peut pas modifier une décision de contrôle (VC17) */
   if (st === "CONSERVE" && ["A_CONTROLER", "QUARANTAINE"].includes(hd.status)) fail(403, "Seul le service Vérification & Contrôle peut lever ce statut.");
   if (["EN_RESTITUTION", "RESTITUE"].includes(hd.status) && st) fail(409, "Document en cours de restitution.");
-  await q("UPDATE held_documents SET emplacement = COALESCE(?, emplacement), status = COALESCE(?, IF(status = 'RECU' AND ? IS NOT NULL, 'CONSERVE', status)) WHERE id = ?", [emp, st || null, emp, hd.id]);
+  /* tout déplacement impose une nouvelle confirmation du stockage (double scan) */
+  await q(`UPDATE held_documents SET emplacement = COALESCE(?, emplacement), location_id = IF(? IS NULL, location_id, ?), stored_at = IF(? IS NULL, stored_at, NULL),
+    status = COALESCE(?, IF(status = 'RECU' AND ? IS NOT NULL, 'CONSERVE', status)) WHERE id = ?`, [emp, emp, loc && loc.id, emp, st || null, emp, hd.id]);
   await q("INSERT INTO stock_movements (held_id, label, staff_id) VALUES (?,?,?)", [hd.id, `${emp ? "Déplacement vers " + emp : ""}${st ? " Statut " + st : ""}`.trim() + (req.body.motif ? ` · motif : ${str(req.body.motif, 120)}` : ""), req.staff.id]);
   U.audit(req, "STOCK_MOVE", "held", hd.reception_ref, emp || st); res.json({ ok: true });
 }));
@@ -586,16 +614,40 @@ router.get("/finance", can("finance.view"), h(async (req, res) => {
 router.get("/commercial", can("commercial.view"), h(async (req, res) => {
   const [prots, renew, byKind] = await Promise.all([
     q(`SELECT p.id, p.kind, p.label, p.prix, p.start_at, p.exp_at, p.suspended, u.prenom, u.nom, u.tel FROM protections p JOIN users u ON u.id = p.user_id ORDER BY p.id DESC LIMIT 200`),
-    q(`SELECT p.id, p.label, p.exp_at, u.prenom, u.nom, u.tel FROM protections p JOIN users u ON u.id = p.user_id WHERE p.exp_at BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL 45 DAY) ORDER BY p.exp_at`),
+    /* abonnements à renouveler (§25–§26) : échéances configurées + expirés depuis moins de 30 jours */
+    q(`SELECT p.id, p.label, p.exp_at, u.prenom, u.nom, u.tel,
+      (SELECT MAX(r.created_at) FROM renewal_reminders r WHERE r.protection_id = p.id) last_reminder, (SELECT COUNT(*) FROM renewal_reminders r WHERE r.protection_id = p.id) reminders
+      FROM protections p JOIN users u ON u.id = p.user_id WHERE p.suspended = 0 AND p.exp_at BETWEEN DATE_SUB(CURDATE(), INTERVAL 30 DAY) AND DATE_ADD(CURDATE(), INTERVAL 31 DAY) ORDER BY p.exp_at`),
     q("SELECT kind, COUNT(*) n FROM protections WHERE exp_at > NOW() AND suspended = 0 GROUP BY kind")
   ]);
-  res.json({ prots: prots.map(p => ({ ...p, status: D.protStatus(p) })), renew, byKind });
+  const list = await RNW.echeances();
+  const portfolio = await one(`SELECT SUM(pf = 'PROSPECT') prospects, SUM(pf = 'CLIENT') clients, SUM(pf = 'ANCIEN_CLIENT') anciens FROM (SELECT ${RNW.PORTFOLIO_SQL} pf FROM users u) x`);
+  const renewOut = renew.map(p => ({ ...p, bucket: RNW.bucket(RNW.daysLeft(p.exp_at), list) })).filter(p => p.bucket);
+  res.json({ prots: prots.map(p => ({ ...p, status: D.protStatus(p) })), renew: renewOut, byKind, echeances: list,
+    portfolio: { prospects: +portfolio.prospects || 0, clients: +portfolio.clients || 0, anciens: +portfolio.anciens || 0, prospectsFiches: (await one("SELECT COUNT(*) n FROM prospects WHERE statut NOT IN ('CONVERTI','PERDU')")).n },
+    renewAuto: (await U.setting("renew_auto", "1")) === "1", renewMessage: await U.setting("renew_message", "") });
 }));
 router.post("/commercial/remind/:id", can("commercial.view"), h(async (req, res) => {
-  const p = await one("SELECT p.*, u.tel, u.prenom FROM protections p JOIN users u ON u.id = p.user_id WHERE p.id = ?", [req.params.id]); if (!p) fail(404, "Protection introuvable.");
-  await U.notify(p.user_id, "Pensez à renouveler votre protection", `${p.label} expire le ${U.fmtD(p.exp_at)}.`, "protections");
-  await U.sms(p.tel, `ID SECOURS : ${p.prenom}, votre protection expire le ${U.fmtD(p.exp_at)}. Renouvelez-la dans l’application.`);
+  const p = await one(`${RNW.PROT_SQL} WHERE p.id = ?`, [req.params.id]); if (!p) fail(404, "Protection introuvable.");
+  const b = RNW.bucket(RNW.daysLeft(p.exp_at), await RNW.echeances());
+  await RNW.send(p, { staffId: req.staff.id, echeance: b ? b.k : null });
   U.audit(req, "RENEWAL_REMINDER", "protection", String(p.id)); res.json({ ok: true });
+}));
+/* historique des relances (§28) : client, date, canal, campagne, message, résultat, agent ou automatisation */
+router.get("/commercial/reminders", can("commercial.view"), h(async (req, res) => {
+  const rows = await q(`SELECT r.id, r.created_at, r.echeance, r.channel, r.campaign_ref, r.message, r.result, r.auto_key IS NOT NULL auto, u.prenom, u.nom, s.prenom sprenom, s.nom snom
+    FROM renewal_reminders r JOIN users u ON u.id = r.user_id LEFT JOIN staff s ON s.id = r.staff_id ORDER BY r.id DESC LIMIT 300`);
+  res.json({ items: rows.map(r => ({ ...r, auto: !!r.auto, origine: r.auto ? "Automatisation" : r.sprenom ? `${r.sprenom} ${r.snom}` : r.campaign_ref ? "Campagne" : "—" })) });
+}));
+/* message de renouvellement paramétrable et relances automatiques (§27) */
+router.put("/commercial/renew-settings", can("settings.manage", "prospects.manage"), h(async (req, res) => {
+  const b = req.body;
+  if (b.message !== undefined) {
+    const m = str(b.message, 400); if (!m || !m.includes("{date}")) fail(400, "Le message doit contenir la variable {date} (date d’expiration).");
+    await q("UPDATE settings SET v = ? WHERE k = 'renew_message'", [m]);
+  }
+  if (b.auto !== undefined) await q("UPDATE settings SET v = ? WHERE k = 'renew_auto'", [b.auto ? "1" : "0"]);
+  U.audit(req, "RENEWAL_SETTINGS", "settings", "renew", JSON.stringify(b).slice(0, 300)); res.json({ ok: true });
 }));
 /* souscription assistée : le commercial crée le compte, l'utilisateur l'active (OTP + mot de passe), paie et enregistre
    lui-même ses documents (COM-01, COM-02, §14). Aucun accès commercial aux données documentaires (COM-11). */
@@ -677,8 +729,14 @@ router.post("/incidents", can("incidents.manage"), h(async (req, res) => {
   U.audit(req, "INCIDENT_CREATED", "incident", ref); res.json({ ok: true });
 }));
 router.patch("/incidents/:ref", can("incidents.manage"), h(async (req, res) => {
-  const st = req.body.statut; if (!["OUVERT", "EN COURS", "RÉSOLU", "CLÔTURÉ"].includes(st)) fail(400, "Statut inconnu.");
-  await q("UPDATE ops_incidents SET statut = ? WHERE ref = ?", [st, req.params.ref]); U.audit(req, "INCIDENT_" + st, "incident", req.params.ref); res.json({ ok: true });
+  const inc = await one("SELECT * FROM ops_incidents WHERE ref = ?", [req.params.ref]); if (!inc) fail(404, "Incident introuvable.");
+  const st = req.body.statut || inc.statut; if (!["OUVERT", "EN COURS", "RÉSOLU", "CLÔTURÉ"].includes(st)) fail(400, "Statut inconnu.");
+  const rep = str(req.body.reponse, 600);
+  await q("UPDATE ops_incidents SET statut = ?, reponse = COALESCE(?, reponse), repondu_at = IF(? IS NULL, repondu_at, NOW()), repondu_by = IF(? IS NULL, repondu_by, ?) WHERE id = ?", [st, rep, rep, rep, req.staff.id, inc.id]);
+  /* l'agent qui a demandé l'assistance est prévenu de la réponse ou du changement de statut */
+  if (inc.kind === "ASSISTANCE" && inc.created_by && (rep || st !== inc.statut))
+    await require("../lib/alerts").push(`assist:${inc.ref}:${Date.now()}`, ["staff:" + inc.created_by], `Votre demande d’assistance ${inc.ref} · ${st.toLowerCase()}`, rep || `Statut : ${st}`, "assistance", "NORMALE");
+  U.audit(req, "INCIDENT_" + st, "incident", req.params.ref, rep || undefined); res.json({ ok: true });
 }));
 
 /* ---------- Super Admin : utilisateurs internes, rôles, agences, paramètres, journaux ---------- */
@@ -874,12 +932,13 @@ router.use("/fin", require("./finance"));
 router.get("/notifications", h(async (req, res) => {
   const rows = await q(`SELECT n.*, r.read_at FROM staff_notifications n LEFT JOIN staff_notification_reads r ON r.notification_id = n.id AND r.staff_id = ?
     WHERE n.resolved = 0 OR n.created_at > DATE_SUB(NOW(), INTERVAL 2 DAY) ORDER BY n.resolved, FIELD(n.priority,'CRITIQUE','HAUTE','NORMALE'), n.id DESC LIMIT 300`, [req.staff.id]);
-  const mine = rows.filter(n => n.perms.split(",").some(p => req.staff.perms.includes(p))).slice(0, 60);
+  /* ciblage par permission, ou nominatif (« staff:<id> ») */
+  const mine = rows.filter(n => n.perms.split(",").some(p => req.staff.perms.includes(p) || p === "staff:" + req.staff.id)).slice(0, 60);
   res.json({ items: mine.map(n => ({ id: n.id, title: n.title, body: n.body, link: n.link, priority: n.priority, resolved: !!n.resolved, read: !!n.read_at, t: n.created_at })),
     unread: mine.filter(n => !n.read_at && !n.resolved).length });
 }));
 router.post("/notifications/read", h(async (req, res) => {
-  const ids = req.body.id ? [+req.body.id] : (await q("SELECT id, perms FROM staff_notifications WHERE resolved = 0")).filter(n => n.perms.split(",").some(p => req.staff.perms.includes(p))).map(n => n.id);
+  const ids = req.body.id ? [+req.body.id] : (await q("SELECT id, perms FROM staff_notifications WHERE resolved = 0")).filter(n => n.perms.split(",").some(p => req.staff.perms.includes(p) || p === "staff:" + req.staff.id)).map(n => n.id);
   for (const id of ids) await q("INSERT IGNORE INTO staff_notification_reads (notification_id, staff_id) VALUES (?,?)", [id, req.staff.id]);
   res.json({ ok: true });
 }));

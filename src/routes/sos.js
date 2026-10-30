@@ -28,7 +28,7 @@ async function sosView(uid) {
     seq: JSON.parse(s.seq), seqDelay: +s.seq_delay, seqEnabled: !!s.seq_enabled, tapsEnabled: !!s.taps_enabled, tapCount: s.tap_count,
     hasCodes: !!s.code_normal_hash, voice: { phrase: s.voice_phrase || "", trained: !!s.voice_trained, enabled: !!s.voice_enabled },
     diag: s.diag ? JSON.parse(s.diag) : null,
-    protection: { active: !!until && until > new Date(), until: s.protection_until, start: s.protection_start },
+    protection: { active: !!until && until > new Date(), until: s.protection_until, start: s.protection_start, beat: s.prot_beat_at, silenceS: +(await U.setting("sos_protection_silence_s", 300)) },
     contacts: contacts.map(c => ({ ...c, ready: !!c.ready })), bt: devices, incidents: n.n
   };
 }
@@ -181,10 +181,23 @@ router.delete("/devices/:id", h(async (req, res) => {
 }));
 
 /* ---------- Mode Protection ---------- */
+/* signal périodique du téléphone : dernière position connue, conservée pour une alerte « téléphone injoignable » */
+async function beat(uid, b) {
+  const loc = b.loc && isFinite(b.loc.lat) && isFinite(b.loc.lng) ? b.loc : null;
+  await q(`UPDATE sos_settings SET prot_beat_at = NOW(), prot_battery = COALESCE(?, prot_battery)${loc ? ", prot_lat = ?, prot_lng = ?, prot_acc = ?, prot_commune = ?" : ""} WHERE user_id = ?`,
+    [b.battery != null && isFinite(b.battery) ? Math.round(b.battery) : null, ...(loc ? [loc.lat, loc.lng, Math.round(loc.acc || 0), str(loc.commune, 40)] : []), uid]);
+}
+router.post("/protection/beat", h(async (req, res) => {
+  const s = await settings(req.user.id);
+  if (!s.protection_until || new Date(s.protection_until) <= new Date()) return res.json({ active: false });
+  await beat(req.user.id, req.body);
+  res.json({ active: true });
+}));
 router.post("/protection", h(async (req, res) => {
   const m = Math.min(720, Math.max(1, Math.round(+req.body.minutes || 30)));
   await settings(req.user.id);
   await q("UPDATE sos_settings SET protection_start = NOW(), protection_until = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE user_id = ?", [m, req.user.id]);
+  await beat(req.user.id, req.body);
   await U.activity(req.user.id, `Mode Protection activé (${m} min)`);
   res.json({ sos: await sosView(req.user.id) });
 }));
@@ -217,7 +230,7 @@ async function createIncident(user, type, o = {}) {
 }
 router.post("/incidents", h(async (req, res) => {
   const type = req.body.type;
-  if (!TRIG[type] || type === "contrainte") fail(400, "Type d’alerte invalide.");
+  if (!TRIG[type] || type === "contrainte" || type === "silence") fail(400, "Type d’alerte invalide.");
   const s = await settings(req.user.id);
   if (!s.enabled && type !== "test") fail(409, "SOS désactivé. Activez-le dans Profil › SOS & Protection.");
   if (type === "test" && !(await one("SELECT id FROM sos_contacts WHERE user_id = ? AND invitation = 'ACCEPTEE' LIMIT 1", [req.user.id]))) fail(409, "Ajoutez et confirmez au moins un contact.");
@@ -281,3 +294,4 @@ router.post("/incidents/:ref/safe", h(async (req, res) => endWithCode(req, res, 
 
 module.exports = router;
 module.exports.publicAlert = pub;
+module.exports.createIncident = createIncident;

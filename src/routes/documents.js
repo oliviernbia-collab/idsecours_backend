@@ -53,16 +53,19 @@ router.get("/:id", h(async (req, res) => {
 router.post("/", upload.fields([{ name: "recto", maxCount: 1 }, { name: "verso", maxCount: 1 }]), h(async (req, res) => {
   const b = req.body, ctx = await D.userCtx(req.user.id);
   if (!ctx.cats[b.cat]) fail(400, "Catégorie inconnue.");
-  const num = normNum(b.num);
-  if (!num || !str(b.nom) || !str(b.prenoms)) fail(400, "Numéro, nom et prénom(s) sont obligatoires.");
+  const cat = ctx.cats[b.cat], f = req.files || {};
+  /* champs exigés par le paramétrage de la catégorie (§36) ; sans numéro, une référence interne est attribuée */
+  const num = normNum(b.num) || (cat.num_required ? "" : "NC" + U.code6());
+  if (!num || !str(b.nom) || !str(b.prenoms)) fail(400, cat.num_required ? "Numéro, nom et prénom(s) sont obligatoires." : "Nom et prénom(s) sont obligatoires.");
+  if (cat.recto_required && !(f.recto || [])[0]) fail(400, `La photo recto est obligatoire pour : ${cat.label}.`);
+  if (cat.verso_required && !(f.verso || [])[0]) fail(400, `La photo verso est obligatoire pour : ${cat.label}.`);
   if (await one("SELECT id FROM documents WHERE user_id = ? AND numero = ?", [req.user.id, num])) fail(409, "Ce numéro est déjà enregistré dans votre dossier.");
   if (b.deliv && b.exp && b.exp < b.deliv) fail(400, "La date d’expiration doit suivre la date de délivrance.");
   const cov = D.coverFor(ctx, b.cat);
   if (!cov) fail(402, "Protection requise.", { code: "PROTECTION_REQUIRED" });
-  const f = req.files || {};
   const r = await q(`INSERT INTO documents (user_id, category_code, numero, nom, prenoms, dob, organisme, date_deliv, date_exp, protection_id, photo_recto, photo_verso)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [req.user.id, b.cat, num, str(b.nom, 60).toUpperCase(), str(b.prenoms, 80), dateOrNull(b.dob), str(b.org, 80), dateOrNull(b.deliv), dateOrNull(b.exp), cov.id,
+    [req.user.id, b.cat, num, str(b.nom, 60).toUpperCase(), str(b.prenoms, 80), dateOrNull(b.dob), cat.has_issuer ? str(b.org, 80) : null, dateOrNull(b.deliv), cat.has_expiry ? dateOrNull(b.exp) : null, cov.id,
      fileUrl((f.recto || [])[0]), fileUrl((f.verso || [])[0])]);
   await hist(r.insertId, `Document enregistré · ${D.protName(cov, ctx)}`);
   await U.activity(req.user.id, "Document enregistré " + ctx.cats[b.cat].short);

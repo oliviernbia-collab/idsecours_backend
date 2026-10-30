@@ -116,7 +116,7 @@ router.post("/found/:ref/collect", h(async (req, res) => {
     const partner = await one("SELECT * FROM partners WHERE status = 'ACTIF' AND zones LIKE ? ORDER BY id LIMIT 1", [`%${commune}%`]) || await one("SELECT * FROM partners WHERE status = 'ACTIF' ORDER BY id LIMIT 1");
     if (partner) {
       const mission = "MIS-" + (await U.nextRef("mis", "X")).split("-").pop().slice(-5);
-      await q("UPDATE found_reports SET step = 2, step_at = NOW(), partner_id = ?, mission_ref = ? WHERE id = ?", [partner.id, mission, f.id]);
+      await q("UPDATE found_reports SET step = 2, step_at = NOW(), assigned_at = NOW(), partner_id = ?, mission_ref = ? WHERE id = ?", [partner.id, mission, f.id]);
       U.audit(req, "COLLECT_ASSIGNED", "found", f.ref, `${partner.nom} · ${mission}`);
     }
   }

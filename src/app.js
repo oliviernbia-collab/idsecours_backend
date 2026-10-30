@@ -32,6 +32,10 @@ app.use("/api/messages", require("./routes/messages"));
 app.use("/api/sos", require("./routes/sos"));
 app.use("/api/alert", require("./routes/sos").publicAlert);
 app.use("/api/admin", require("./routes/admin"));
+app.use("/api/admin", require("./routes/stock"));
+app.use("/api/admin", require("./routes/marketing"));
+app.use("/api/admin", require("./routes/cash"));
+app.use("/api/admin", require("./routes/supervision"));
 app.use("/api/courier", require("./routes/courier"));
 app.use("/api", require("./routes/public"));
 

@@ -26,6 +26,22 @@ const RULES = [
   { id: "sos", perms: ["sos.monitor", "staff.manage"], link: "sos", title: "Alerte SOS non prise en charge", priority: "CRITIQUE",
     sql: h => [`SELECT ref k, CONCAT('#', ref, ' · déclenchée il y a ', TIMESTAMPDIFF(MINUTE, created_at, NOW()), ' min, aucun contact n’a pris en charge') b FROM sos_incidents
       WHERE closed = 0 AND is_test = 0 AND status NOT IN ('PRIS_EN_CHARGE','INTERVENTION_EN_COURS') AND created_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)`, [h.alert_sos_min]] },
+  { id: "sla", perms: ["collectes.manage", "performance.view"], link: "partners", title: "SLA partenaire dépassé", priority: "HAUTE",
+    sql: () => ["SELECT f.ref k, CONCAT(p.nom, ' · mission ', f.mission_ref, ' · affectée il y a ', TIMESTAMPDIFF(HOUR, f.assigned_at, NOW()), ' h (délai convenu ', p.sla_collecte_h, ' h)') b FROM found_reports f JOIN partners p ON p.id = f.partner_id WHERE f.step BETWEEN 2 AND 4 AND f.assigned_at < DATE_SUB(NOW(), INTERVAL p.sla_collecte_h HOUR)", []] },
+  { id: "contrat", perms: ["partners.manage", "collectes.manage"], link: "partners", title: "Contrat partenaire expiré ou expirant",
+    sql: () => ["SELECT id k, CONCAT(nom, ' · fin de contrat le ', DATE_FORMAT(contrat_fin, '%d/%m/%Y')) b FROM partners WHERE status = 'ACTIF' AND contrat_fin IS NOT NULL AND contrat_fin < DATE_ADD(CURDATE(), INTERVAL 15 DAY)", []] },
+  { id: "cash", perms: ["finance.view"], link: "cash", title: "Clôture de caisse à contrôler",
+    sql: () => ["SELECT c.ref k, CONCAT(c.ref, ' · ', a.nom, ' · écart ', COALESCE(c.ecart, 0), ' FCFA') b FROM cash_sessions c JOIN agencies a ON a.id = c.agency_id WHERE c.status IN ('A_CONTROLER','ECART_A_JUSTIFIER')", []] },
+  { id: "trf", perms: ["stock.transfer.authorize"], link: "stock-ops", title: "Transfert entre agences à autoriser",
+    sql: () => ["SELECT t.ref k, CONCAT(t.ref, ' · ', h.reception_ref, ' · ', t.motif) b FROM stock_transfers t JOIN held_documents h ON h.id = t.held_id WHERE t.status = 'DEMANDE'", []] },
+  { id: "transit48", perms: ["reception.manage", "performance.view"], link: "stock-ops", title: "Document en transit entre agences depuis plus de 48 h", priority: "HAUTE",
+    sql: () => ["SELECT ref k, CONCAT(ref, ' · parti le ', DATE_FORMAT(sent_at, '%d/%m %H:%i'), ', non réceptionné') b FROM stock_transfers WHERE status = 'EN_TRANSIT' AND sent_at < DATE_SUB(NOW(), INTERVAL 48 HOUR)", []] },
+  { id: "cmp", perms: ["campaigns.validate"], link: "campaigns", title: "Campagne commerciale à valider",
+    sql: () => ["SELECT ref k, CONCAT(ref, ' · ', nom) b FROM campaigns WHERE statut = 'A_VALIDER'", []] },
+  { id: "opp", perms: ["prospects.manage"], link: "opportunities", title: "Opportunité sans activité depuis 10 jours",
+    sql: () => ["SELECT ref k, CONCAT(ref, ' · ', titre) b FROM opportunities WHERE statut NOT IN ('CONVERTI','PERDU') AND updated_at < DATE_SUB(NOW(), INTERVAL 10 DAY)", []] },
+  { id: "prospect", perms: ["prospects.manage"], link: "commercial", title: "Prospect non contacté depuis 48 h",
+    sql: () => ["SELECT id k, CONCAT(nom, COALESCE(CONCAT(' · ', tel), '')) b FROM prospects WHERE statut = 'NOUVEAU' AND created_at < DATE_SUB(NOW(), INTERVAL 48 HOUR)", []] },
   { id: "incident", perms: ["incidents.manage", "staff.manage"], link: "incidents", title: "Incident critique ouvert", priority: "CRITIQUE",
     sql: () => ["SELECT ref k, CONCAT(ref, ' · ', titre) b FROM ops_incidents WHERE priorite = 'CRITIQUE' AND statut IN ('OUVERT','EN COURS')", []] }
 ];

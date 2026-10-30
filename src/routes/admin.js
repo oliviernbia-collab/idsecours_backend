@@ -216,7 +216,7 @@ router.post("/founds/:ref/assign", can("collectes.manage"), h(async (req, res) =
   const p = await one("SELECT * FROM partners WHERE id = ? AND status = 'ACTIF'", [req.body.partner]); if (!p) fail(400, "Partenaire indisponible.");
   if (f.step >= 5) fail(409, "Document déjà remis.");
   const mission = f.mission_ref || "MIS-" + (await U.nextRef("mis", "X")).split("-").pop().slice(-5);
-  await q("UPDATE found_reports SET partner_id = ?, mission_ref = ?, step = GREATEST(step, 2), step_at = NOW() WHERE id = ?", [p.id, mission, f.id]);
+  await q("UPDATE found_reports SET partner_id = ?, mission_ref = ?, step = GREATEST(step, 2), step_at = NOW(), assigned_at = NOW() WHERE id = ?", [p.id, mission, f.id]);
   U.audit(req, "COLLECT_ASSIGNED", "found", f.ref, `${p.nom} · ${mission}`);
   res.json({ ok: true });
 }));
@@ -291,9 +291,24 @@ router.post("/found-checks/:id/decision", can("foundcheck.manage"), h(async (req
   fail(400, "Décision inconnue.");
 }));
 
+const PARTNER_ST = ["ACTIF", "TEMPORAIREMENT_INDISPONIBLE", "SUSPENDU", "CONTRAT_EXPIRE", "EN_INTEGRATION", "RESILIE"];
+const PARTNER_FIELDS = ["nom", "nom_commercial", "contact", "tel", "email", "zones", "horaires", "prestations", "date_debut", "contrat_fin", "conditions", "integration",
+  "sla_prise_min", "sla_collecte_h", "sla_depot_h", "sla_livraison_h", "tarif_collecte", "tarif_livraison", "vehicule", "collecteur"];
 router.get("/partners", can("founds.view", "collectes.manage", "partners.manage"), h(async (req, res) => {
-  res.json({ items: await q(`SELECT p.*, (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id) missions,
-    (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id AND f.step >= 5) done FROM partners p ORDER BY p.id`) });
+  /* SLA (Collecte §51) : délais réels comparés aux délais contractuels */
+  const rows = await q(`SELECT p.*, (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id) missions,
+    (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id AND f.step >= 5) done,
+    (SELECT ROUND(AVG(TIMESTAMPDIFF(MINUTE, f.assigned_at, f.courier_enroute_at))) FROM found_reports f WHERE f.partner_id = p.id AND f.courier_enroute_at IS NOT NULL) prise_min,
+    (SELECT ROUND(AVG(TIMESTAMPDIFF(MINUTE, f.assigned_at, f.handed_at)) / 60, 1) FROM found_reports f WHERE f.partner_id = p.id AND f.handed_at IS NOT NULL) collecte_h,
+    (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id AND f.handed_at IS NOT NULL AND TIMESTAMPDIFF(MINUTE, f.assigned_at, f.handed_at) > p.sla_collecte_h * 60) collecte_hors_delai,
+    (SELECT ROUND(AVG(TIMESTAMPDIFF(MINUTE, f.handed_at, f.received_at)) / 60, 1) FROM found_reports f WHERE f.partner_id = p.id AND f.received_at IS NOT NULL) depot_h,
+    (SELECT COUNT(*) FROM found_reports f WHERE f.partner_id = p.id AND f.step BETWEEN 2 AND 4 AND f.assigned_at < DATE_SUB(NOW(), INTERVAL p.sla_collecte_h HOUR)) en_retard,
+    (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id) livraisons,
+    (SELECT ROUND(AVG(TIMESTAMPDIFF(MINUTE, d.out_at, d.delivered_at)) / 60, 1) FROM deliveries d WHERE d.partner_id = p.id AND d.delivered_at IS NOT NULL) livraison_h,
+    (SELECT COUNT(*) FROM deliveries d WHERE d.partner_id = p.id AND d.status IN ('ECHEC','REMISE_BLOQUEE','RETOURNEE')) echecs,
+    (SELECT COUNT(*) FROM ops_incidents i JOIN found_reports f ON f.ref = i.dossier_ref WHERE f.partner_id = p.id) incidents
+    FROM partners p ORDER BY p.id`);
+  res.json({ items: rows.map(({ pin_hash, ...p }) => ({ ...p, contrat_expire: !!p.contrat_fin && new Date(p.contrat_fin) < new Date() })) });
 }));
 router.post("/partners", can("partners.manage"), h(async (req, res) => {
   const b = req.body; if (!str(b.nom) || !str(b.collecteur)) fail(400, "Nom et collecteur obligatoires.");
@@ -307,9 +322,25 @@ router.patch("/partners/:id", can("partners.manage"), h(async (req, res) => {
     await q("UPDATE partners SET pin_hash = ? WHERE id = ?", [await bcrypt.hash(String(req.body.pin), 10), req.params.id]);
     U.audit(req, "PARTNER_PIN_RESET", "partner", req.params.id); return res.json({ ok: true });
   }
-  const st = req.body.status === "SUSPENDU" ? "SUSPENDU" : "ACTIF";
-  await q("UPDATE partners SET status = ? WHERE id = ?", [st, req.params.id]);
-  U.audit(req, "PARTNER_STATUS", "partner", req.params.id, st); res.json({ ok: true });
+  if (req.body.status !== undefined) {
+    const st = req.body.status, motif = str(req.body.motif, 255);
+    if (!PARTNER_ST.includes(st)) fail(400, "Statut inconnu.");
+    if (["SUSPENDU", "RESILIE", "TEMPORAIREMENT_INDISPONIBLE"].includes(st) && !motif) fail(400, "Motif obligatoire pour ce statut.");
+    await q("UPDATE partners SET status = ?, status_motif = ? WHERE id = ?", [st, motif || null, req.params.id]);
+    U.audit(req, "PARTNER_STATUS", "partner", req.params.id, `${st}${motif ? " · " + motif : ""}`); return res.json({ ok: true });
+  }
+  /* contrat & SLA : toute modification est journalisée (ancienne → nouvelle valeur) */
+  const cur = await one("SELECT * FROM partners WHERE id = ?", [req.params.id]); if (!cur) fail(404, "Partenaire introuvable.");
+  const set = U.pick(req.body, PARTNER_FIELDS); const keys = Object.keys(set); if (!keys.length) fail(400, "Rien à modifier.");
+  for (const k of keys) {
+    if (/^(sla_|tarif_)/.test(k) && (!Number.isInteger(+set[k]) || +set[k] < 0)) fail(400, `Valeur invalide pour ${k}.`);
+    if (/^(date_debut|contrat_fin)$/.test(k)) set[k] = U.dateOrNull(set[k]);
+    else if (typeof set[k] === "string") set[k] = str(set[k], k === "conditions" ? 500 : 120);
+  }
+  if ("integration" in set && !["MANUEL", "PORTAIL", "API"].includes(set.integration)) fail(400, "Mode d’intégration invalide.");
+  await q(`UPDATE partners SET ${keys.map(k => k + " = ?").join(", ")} WHERE id = ?`, [...keys.map(k => set[k]), cur.id]);
+  U.audit(req, "PARTNER_CONTRACT", "partner", cur.nom, keys.map(k => `${k}: ${cur[k] instanceof Date ? cur[k].toISOString().slice(0, 10) : cur[k]} → ${set[k]}`).join(" ; "));
+  res.json({ ok: true });
 }));
 
 /* ---------- réception & stock ---------- */
@@ -688,26 +719,41 @@ router.put("/roles/:id", can("roles.manage"), h(async (req, res) => {
   U.audit(req, "ROLE_PERMS", "role", r.code, perms.join(",")); res.json({ ok: true });
 }));
 router.get("/agencies", can("agencies.manage", "dashboard.view"), h(async (req, res) => {
-  res.json({ items: await q(`SELECT a.*, (SELECT COUNT(*) FROM held_documents h WHERE h.agency_id = a.id AND h.status IN ('RECU','CONSERVE','EN_RESTITUTION')) stock,
+  res.json({ items: await q(`SELECT a.*, (SELECT COUNT(*) FROM held_documents h WHERE h.agency_id = a.id AND h.status IN ('A_CONTROLER','RECU','CONSERVE','QUARANTAINE','EN_RESTITUTION')) stock,
+    (SELECT COUNT(*) FROM recoveries r JOIN held_documents h ON h.id = r.held_id WHERE h.agency_id = a.id AND r.done_at IS NOT NULL) restitues,
+    (SELECT COUNT(*) FROM found_reports f WHERE f.agency_id = a.id) collectes,
+    (SELECT COUNT(*) FROM ops_incidents i WHERE i.agency_id = a.id AND i.statut IN ('OUVERT','EN COURS')) incidents,
     (SELECT COUNT(*) FROM staff s WHERE s.agency_id = a.id) agents FROM agencies a ORDER BY a.id`) });
 }));
 router.post("/agencies", can("agencies.manage"), h(async (req, res) => {
   const b = req.body; if (!str(b.nom) || !str(b.commune) || !str(b.adresse)) fail(400, "Nom, commune et adresse obligatoires.");
-  await q("INSERT INTO agencies (code, nom, commune, adresse, tel, horaires, lat, lng) VALUES (?,?,?,?,?,?,?,?)",
-    ["AG-" + U.normNum(b.commune).slice(0, 3) + U.rnd(10, 99), str(b.nom, 80), str(b.commune, 40), str(b.adresse, 160), str(b.tel, 30), str(b.horaires, 60) || "Lun–Sam · 8h–17h", +b.lat || null, +b.lng || null]);
+  await q("INSERT INTO agencies (code, nom, commune, adresse, tel, horaires, lat, lng, email, responsable, capacite, services) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+    ["AG-" + U.normNum(b.commune).slice(0, 3) + U.rnd(10, 99), str(b.nom, 80), str(b.commune, 40), str(b.adresse, 160), str(b.tel, 30), str(b.horaires, 60) || "Lun–Sam · 8h–17h", +b.lat || null, +b.lng || null,
+     str(b.email, 120), str(b.responsable, 80), +b.capacite > 0 ? Math.round(+b.capacite) : null, str(b.services, 160) || "Réception, conservation, restitution"]);
   U.audit(req, "AGENCY_CREATED", "agency", b.nom); res.json({ ok: true });
 }));
 router.patch("/agencies/:id", can("agencies.manage"), h(async (req, res) => {
-  const st = req.body.status === "SUSPENDUE" ? "SUSPENDUE" : "ACTIVE";
-  await q("UPDATE agencies SET status = ? WHERE id = ?", [st, req.params.id]); U.audit(req, "AGENCY_STATUS", "agency", req.params.id, st); res.json({ ok: true });
+  if (req.body.status !== undefined) {
+    const st = req.body.status, motif = str(req.body.motif, 255);
+    if (!["ACTIVE", "TEMPORAIREMENT_INDISPONIBLE", "SUSPENDUE"].includes(st)) fail(400, "Statut inconnu.");
+    if (st !== "ACTIVE" && !motif) fail(400, "Le motif est obligatoire pour suspendre ou rendre indisponible une agence (§28).");
+    await q("UPDATE agencies SET status = ?, status_motif = ? WHERE id = ?", [st, st === "ACTIVE" ? null : motif, req.params.id]);
+    U.audit(req, "AGENCY_STATUS", "agency", req.params.id, `${st}${motif ? " · " + motif : ""}`); return res.json({ ok: true });
+  }
+  const cur = await one("SELECT * FROM agencies WHERE id = ?", [req.params.id]); if (!cur) fail(404, "Agence introuvable.");
+  const set = U.pick(req.body, ["nom", "adresse", "tel", "email", "horaires", "responsable", "capacite", "services", "lat", "lng"]); const keys = Object.keys(set);
+  if (!keys.length) fail(400, "Rien à modifier.");
+  for (const k of keys) set[k] = ["capacite", "lat", "lng"].includes(k) ? (set[k] === "" || set[k] == null ? null : +set[k]) : str(set[k], 160);
+  await q(`UPDATE agencies SET ${keys.map(k => k + " = ?").join(", ")} WHERE id = ?`, [...keys.map(k => set[k]), cur.id]);
+  U.audit(req, "AGENCY_UPDATED", "agency", cur.code, keys.map(k => `${k}: ${cur[k]} → ${set[k]}`).join(" ; ")); res.json({ ok: true });
 }));
 
 /* paramètres : catégories, packs, formules, moyens de paiement, paramètres système (avec historique des tarifs) */
 const EDITABLE = {
-  categories: { table: "doc_categories", key: "code", fields: ["label", "prix", "frais", "official", "active"] },
+  categories: { table: "doc_categories", key: "code", fields: ["label", "prix", "frais", "official", "active", "num_required", "recto_required", "verso_required", "has_expiry", "has_issuer", "description"] },
   packs: { table: "packs", key: "code", fields: ["label", "prix", "quota500", "quota300", "description", "active"] },
   formules: { table: "formules", key: "code", fields: ["label", "prix", "max_docs", "collecte_label", "livraison_label", "collect_quota", "delivery_quota", "priorite", "publication", "active"] },
-  paymethods: { table: "pay_methods", key: "code", fields: ["label", "active"] },
+  paymethods: { table: "pay_methods", key: "code", fields: ["label", "active", "provider", "fee_pct", "fee_fixed", "env"] },
   settings: { table: "settings", key: "k", fields: ["v"] }
 };
 router.get("/settings", can("settings.manage", "finance.view", "commercial.view"), h(async (req, res) => {
@@ -720,12 +766,28 @@ router.put("/settings/:entity/:code", can("settings.manage"), h(async (req, res)
   const e = EDITABLE[req.params.entity]; if (!e) fail(404, "Paramètre inconnu.");
   const cur = await one(`SELECT * FROM ${e.table} WHERE ${e.key} = ?`, [req.params.code]); if (!cur) fail(404, "Élément introuvable.");
   const set = U.pick(req.body, e.fields); const keys = Object.keys(set); if (!keys.length) fail(400, "Rien à modifier.");
-  for (const k of keys) if (/prix|frais|quota|max_docs/.test(k) && (!Number.isInteger(+set[k]) || +set[k] < -1)) fail(400, `Valeur invalide pour ${k}.`);
+  for (const k of keys) if (/prix|frais|quota|max_docs|fee_fixed/.test(k) && (!Number.isInteger(+set[k]) || +set[k] < -1)) fail(400, `Valeur invalide pour ${k}.`);
+  if ("fee_pct" in set && !(+set.fee_pct >= 0 && +set.fee_pct <= 100)) fail(400, "Frais en % : valeur entre 0 et 100.");
+  if ("env" in set && !["SIMULATION", "TEST", "PRODUCTION"].includes(set.env)) fail(400, "Environnement invalide.");
   await q(`UPDATE ${e.table} SET ${keys.map(k => k + " = ?").join(", ")} WHERE ${e.key} = ?`, [...keys.map(k => set[k]), req.params.code]);
   for (const k of keys) if (String(cur[k]) !== String(set[k])) await q("INSERT INTO tariff_history (entity, code, field, old_value, new_value, staff_id) VALUES (?,?,?,?,?,?)", [req.params.entity, req.params.code, k, String(cur[k]).slice(0, 60), String(set[k]).slice(0, 60), req.staff.id]);
   /* règles de correspondance versionnées (VC19) */
   if (req.params.entity === "settings" && /^match_(w_|forte|verifier)/.test(req.params.code)) await q("UPDATE settings SET v = CAST(v AS UNSIGNED) + 1 WHERE k = 'match_rules_version'");
   U.audit(req, "SETTINGS_UPDATED", req.params.entity, req.params.code, JSON.stringify(set)); res.json({ ok: true });
+}));
+/* création d'une catégorie de document (§35) : nouveaux types sans modifier l'application */
+router.post("/settings/categories", can("settings.manage"), h(async (req, res) => {
+  const b = req.body, code = String(b.code || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 10);
+  if (!code || !str(b.label) || !str(b.short)) fail(400, "Code, libellé et libellé court sont obligatoires.");
+  if (await one("SELECT code FROM doc_categories WHERE code = ?", [code])) fail(409, "Ce code existe déjà.");
+  for (const k of ["prix", "frais"]) if (!Number.isInteger(+b[k]) || +b[k] < 0) fail(400, `Valeur invalide pour ${k}.`);
+  const pos = await one("SELECT COALESCE(MAX(position), 0) + 1 p FROM doc_categories");
+  await q(`INSERT INTO doc_categories (code, label, short, prix, frais, icon, color, official, prefix, position, num_required, recto_required, verso_required, has_expiry, has_issuer, description)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [code, str(b.label, 80), str(b.short, 40), +b.prix, +b.frais, str(b.icon, 30) || "doc", /^#[0-9a-f]{6}$/i.test(b.color) ? b.color : "#6A7570",
+    b.official ? 1 : 0, str(b.prefix, 4) || "", pos.p, b.num_required === 0 ? 0 : 1, b.recto_required ? 1 : 0, b.verso_required ? 1 : 0, b.has_expiry === 0 ? 0 : 1, b.has_issuer === 0 ? 0 : 1, str(b.description, 255) || null]);
+  await q("INSERT INTO tariff_history (entity, code, field, old_value, new_value, staff_id) VALUES ('categories', ?, 'création', '—', ?, ?)", [code, `${+b.prix} / ${+b.frais} FCFA`, req.staff.id]);
+  U.audit(req, "CATEGORY_CREATED", "categories", code, str(b.label, 80));
+  res.status(201).json({ ok: true, code });
 }));
 router.get("/audit", can("audit.view"), h(async (req, res) => {
   const { limit, offset } = paging(req);

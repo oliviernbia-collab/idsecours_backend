@@ -2,7 +2,7 @@
 const { q, one } = require("../config/db");
 const U = require("./util");
 
-const TRIG = { immediat: "SOS immédiat (bouton)", invisible: "SOS invisible (boutons physiques)", taps: "SOS invisible (tapotements)", vocal: "Code vocal (Mode Protection)", bluetooth: "Déclencheur Bluetooth", contrainte: "Code sous contrainte", test: "Test du SOS" };
+const TRIG = { immediat: "SOS immédiat (bouton)", invisible: "SOS invisible (boutons physiques)", taps: "SOS invisible (tapotements)", vocal: "Code vocal (Mode Protection)", bluetooth: "Déclencheur Bluetooth", contrainte: "Code sous contrainte", test: "Test du SOS", silence: "Mode Protection · téléphone injoignable" };
 
 async function ilog(incId, label) {
   await q("INSERT INTO sos_events (incident_id, label) VALUES (?,?)", [incId, label]);
@@ -37,8 +37,8 @@ async function sosTick() {
     const el = +inc.el;
     if (inc.status === "CRÉÉ" && el > 600) { await q("UPDATE sos_incidents SET status = 'DÉCLENCHÉ' WHERE id = ?", [inc.id]); await ilog(inc.id, `Incident #${inc.ref} créé`); }
     else if (inc.status === "DÉCLENCHÉ" && el > 1600) {
-      const pos = await one("SELECT accuracy FROM sos_positions WHERE incident_id = ? ORDER BY id DESC LIMIT 1", [inc.id]);
-      await ilog(inc.id, pos ? `GPS obtenu — précision ${pos.accuracy} m` : "Position non partagée (paramètre)");
+      const pos = await one("SELECT accuracy, source FROM sos_positions WHERE incident_id = ? ORDER BY id DESC LIMIT 1", [inc.id]);
+      await ilog(inc.id, !pos ? "Position non partagée (paramètre)" : pos.source === "Dernière connue" ? `Dernière position connue transmise (non actuelle) — précision ${pos.accuracy} m` : `${pos.source === "GPS" ? "GPS obtenu" : "Position obtenue (" + pos.source + ")"} — précision ${pos.accuracy} m`);
       await q("UPDATE sos_incidents SET status = 'TRANSMISSION_EN_COURS' WHERE id = ?", [inc.id]);
     } else if (inc.status === "TRANSMISSION_EN_COURS" && el > 2600) {
       await ilog(inc.id, "Incident transmis au serveur ID SECOURS");
@@ -77,14 +77,37 @@ async function collectTick() {
   }
 }
 
-let busy = false;
+/* Mode Protection (SOS §12) : sans signal du téléphone pendant le délai configuré, le serveur déclenche
+   lui-même l'alerte avec la dernière position connue (téléphone éteint, batterie vide, réseau coupé) */
+async function protectionTick() {
+  const silence = +(await U.setting("sos_protection_silence_s", 300));
+  const rows = await q(`SELECT s.*, u.prenom, u.nom FROM sos_settings s JOIN users u ON u.id = s.user_id
+    WHERE s.enabled = 1 AND s.protection_until > NOW() AND s.prot_beat_at < DATE_SUB(NOW(), INTERVAL ? SECOND)`, [silence]);
+  for (const s of rows) {
+    /* une seule alerte par session : le mode est arrêté avant de créer l'incident */
+    const r = await q("UPDATE sos_settings SET protection_until = NULL WHERE user_id = ? AND protection_until IS NOT NULL", [s.user_id]);
+    if (!r.affectedRows) continue;
+    const ref = await require("../routes/sos").createIncident({ id: s.user_id, prenom: s.prenom, nom: s.nom }, "silence", { battery: s.prot_battery, network: "Injoignable" });
+    const inc = await one("SELECT id FROM sos_incidents WHERE ref = ?", [ref]);
+    const beat = new Date(s.prot_beat_at).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+    if (s.share_loc && s.prot_lat != null)
+      await q("INSERT INTO sos_positions (incident_id, lat, lng, accuracy, source, commune, created_at) VALUES (?,?,?,?,?,?,?)", [inc.id, s.prot_lat, s.prot_lng, s.prot_acc || 0, "Dernière connue", s.prot_commune, s.prot_beat_at]);
+    await ilog(inc.id, `Aucun signal du téléphone depuis ${beat} (${Math.round(silence / 60)} min) — alerte déclenchée par le serveur${s.prot_lat != null ? " avec la dernière position connue de " + beat : ""}`);
+    await U.activity(s.user_id, `Mode Protection : téléphone injoignable depuis ${beat}, alerte ${ref} déclenchée`);
+  }
+}
+
+let busy = false, protAt = 0;
 function start() {
   const alerts = require("./alerts");
   const runAlerts = () => alerts.tick().catch(e => console.error("[alertes]", e.message));
   setTimeout(runAlerts, 5000); setInterval(runAlerts, 60000);
+  /* sauvegarde automatique (périodicité : paramètre backup_auto_h) */
+  const runBackup = () => require("./backup").autoTick().catch(e => console.error("[sauvegarde]", e.message));
+  setTimeout(runBackup, 30000); setInterval(runBackup, 600000);
   setInterval(async () => {
     if (busy) return; busy = true;
-    try { await sosTick(); await collectTick(); } catch (e) { console.error("[engine]", e.message); } finally { busy = false; }
+    try { await sosTick(); await collectTick(); if (Date.now() - protAt > 10000) { protAt = Date.now(); await protectionTick(); } } catch (e) { console.error("[engine]", e.message); } finally { busy = false; }
   }, 1000);
 }
 

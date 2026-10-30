@@ -53,7 +53,7 @@ router.post("/quote", h(async (req, res) => {
 
 router.post("/", h(async (req, res) => {
   const qt = await quote(req);
-  const m = await one("SELECT * FROM pay_methods WHERE code = ? AND active = 1", [req.body.method]);
+  const m = await one("SELECT * FROM pay_methods WHERE code = ? AND active = 1 AND agency_only = 0", [req.body.method]);
   if (!m) fail(400, "Moyen de paiement indisponible.");
   const phone = U.normTel(req.body.phone);
   if (m.code !== "CB" && phone.length < 8) fail(400, "Numéro de paiement invalide.");
@@ -131,3 +131,5 @@ router.get("/:ref", h(async (req, res) => {
 }));
 
 module.exports = router;
+module.exports.finalize = finalize; // réutilisé pour les encaissements en espèces au guichet
+module.exports.quote = quote;

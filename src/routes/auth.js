@@ -63,6 +63,9 @@ router.post("/login", h(async (req, res) => {
   if (!tel || pw.length < 4) fail(400, "Renseignez votre numéro et votre mot de passe.");
   const u = await one("SELECT * FROM users WHERE tel = ?", [tel]);
   if (u && u.status === "A_ACTIVER") fail(403, "Compte à activer : utilisez « Mot de passe oublié / activer mon compte » avec votre numéro.");
+  /* numéro d'un agent sans compte citoyen : orienter vers l'espace agents (connexion par e-mail + OTP) */
+  if (!u && await one("SELECT id FROM staff WHERE REPLACE(REPLACE(tel, ' ', ''), '.', '') = ? AND status = 'ACTIVE'", [tel]))
+    fail(401, "Ce numéro correspond à un compte agent ID SECOURS : connectez-vous sur l’espace agents (/admin) avec votre e-mail professionnel.", { code: "STAFF_ACCOUNT" });
   if (!u || !(await bcrypt.compare(pw, u.password_hash))) fail(401, "Numéro ou mot de passe incorrect.");
   if (u.status !== "ACTIF") fail(403, "Compte suspendu. Contactez le support.");
   await activity(u.id, "Connexion par mot de passe");

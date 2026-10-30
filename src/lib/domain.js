@@ -7,7 +7,7 @@ async function catalog() {
     q("SELECT * FROM doc_categories WHERE active = 1 ORDER BY position"),
     q("SELECT * FROM packs WHERE active = 1"),
     q("SELECT * FROM formules WHERE active = 1 ORDER BY position"),
-    q("SELECT * FROM pay_methods WHERE active = 1 ORDER BY position")
+    q("SELECT * FROM pay_methods WHERE active = 1 AND agency_only = 0 ORDER BY position") // les espèces ne sont encaissées qu'au guichet
   ]);
   return { cats, packs, formules, pay };
 }
